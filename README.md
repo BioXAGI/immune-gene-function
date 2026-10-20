@@ -7,12 +7,6 @@ cell state from bulk tumor RNA-seq (TCGA via UCSC Xena, or your own data). Per c
   CTL x gene Cox interaction test (Jiang et al., Nat Med 2018), meta-analysis, plots.
   Run `python immune_gene_function.py --describe` for a JSON schema of methods and outputs.
 - `AGENT_GUIDE.md`: usage and interpretation rules, written for other AI agents and models.
-- `analyses/`: follow-up scripts for specific questions (OS gene models, gene-gene synergy, TNF/BIRC/KRAS,
-  NOTCH, STK11/PTGES, etc.). They import `immune_gene_function`, so run them from the repo root with
-  `PYTHONPATH=.`. Scripts using cBioPortal need `SSL_CERT_FILE` set to certifi's path on some Windows setups.
-  `notch_tp53.py`, `stk11_ptges_luad.py`, `klk11_tp53.py`, `lrrc33_tp53.py`, `gene_panel_*.py` are earlier
-  one-off scripts with hard-coded `output/...` paths; treat them as legacy.
-- `literature_search/`: PubMed and ClinicalTrials.gov query scripts.
 
 ## Quick start
 ```

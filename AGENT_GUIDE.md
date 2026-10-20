@@ -56,5 +56,4 @@ When `--interaction-score` is not CTL, the columns still carry the `CTL` names b
 
 ## Reference
 Jiang P et al. Signatures of T cell dysfunction and exclusion predict cancer immunotherapy response.
-Nat Med 24:1550-1558 (2018). Related one-off scripts in this folder (notch_tp53.py, stk11_ptges_luad.py,
-adar_ifn_check.py, pubmed_*.py, ctgov_notch.py) are separate analyses, not part of this pipeline.
+Nat Med 24:1550-1558 (2018).
