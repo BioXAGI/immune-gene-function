@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+xena_cache/
+*_results/
+output/
+*.log
+*.png
+*.csv
+*.json
+!requirements.json
