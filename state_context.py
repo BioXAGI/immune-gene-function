@@ -17,8 +17,11 @@ Commands
 
 Method (run)
   1. Data per cohort: TCGA RNA-seq (UCSC Xena, log2), one primary tumor per patient, signature scores
-     (mean z-score of marker genes; see immune_gene_function.SIGS), state abundances matched by the
+     (mean z-score of marker genes; SIGS in this file), state abundances matched by the
      12-character patient barcode.
+     Confounders adjusted (default): LEUKOCYTE = PTPRC expression (total immune content) and CAF = mean z of
+     FAP, COL1A1, COL1A2, COL3A1, PDGFRB, THBS2 (stromal content); MSI-H with --msi. --adjust also accepts
+     age, stage, MSI_H, any signature name, or any column of the score table.
   2. Partial Spearman: rank query, target and covariates; regress query ranks and target ranks on
      covariate ranks; correlate the residuals. Default covariates: LEUKOCYTE (PTPRC), CAF score,
      plus MSI-H with --msi where available. A covariate equal to the target is dropped.
@@ -36,7 +39,8 @@ Interpretation
   - With thousands of tumors, small correlations become significant; read the size of r and its CI.
   - Correlation is association, not causation; bulk deconvolution cannot localize expression.
 
-Requires: numpy, pandas, scipy; imports immune_gene_function.py from the same folder.
+Standalone. Requires numpy, pandas, scipy (no other project files). TCGA data are downloaded from
+UCSC Xena on first use into --cache (default xena_cache/).
 """
 import argparse
 import glob
@@ -49,9 +53,194 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-import immune_gene_function as igf
+import gzip
+import urllib.parse
+import urllib.request
 
 warnings.filterwarnings("ignore")
+
+# ============================================================================= data and statistics (standalone)
+XENA = "https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/"
+TUMOR_CODES = ["01", "03", "06"]           # primary, blood-derived primary, metastatic (preference order)
+MSI_COLUMNS = ["CDE_ID_3226963", "MSI_updated_Oct62011", "msi", "MSI", "msi_status"]
+SIGS = {
+    "CTL": ["CD8A", "CD8B", "GZMA", "GZMB", "PRF1"],
+    "IFNG": ["IFNG", "STAT1", "CXCL9", "CXCL10", "IDO1", "HLA-DRA"],
+    "EXHAUSTION": ["PDCD1", "HAVCR2", "LAG3", "TIGIT", "TOX", "CTLA4"],
+    "TSTEM": ["SELL", "CCR7", "IL7R"],
+    "TREG": ["FOXP3", "IL2RA", "IKZF2"],
+    "NK": ["KLRD1", "NCR1", "KLRF1", "SH2D1B"],
+    "BCELL": ["MS4A1", "CD79A", "CD19", "BANK1"],
+    "MONOCYTE": ["CD14", "FCN1", "VCAN", "S100A12"],
+    "M1_LIKE": ["CXCL9", "CXCL10", "IL1B", "CD80", "NOS2"],
+    "M2_LIKE": ["CD163", "MRC1", "MSR1", "F13A1", "CD209"],
+    "MACROPHAGE": ["CD68", "CSF1R", "C1QA", "C1QB", "C1QC"],
+    "NEUTROPHIL": ["CSF3R", "FCGR3B", "CXCR2", "FPR1", "CMTM2"],
+    "MDSC_LIKE": ["S100A8", "S100A9", "ARG1", "OLR1"],
+    "CDC": ["CLEC9A", "XCR1", "CD1C", "LAMP3"],
+    "CAF": ["FAP", "COL1A1", "COL1A2", "COL3A1", "PDGFRB", "THBS2"],
+    "ENDOTHELIAL": ["PECAM1", "VWF", "CDH5", "KDR"],
+    "VEGF_ANGIO": ["VEGFA", "VEGFC", "ESM1", "ANGPT2", "PGF"],
+    "ANTIGEN_PRES": ["B2M", "HLA-A", "HLA-B", "HLA-C", "TAP1", "TAP2"],
+    "LEUKOCYTE": ["PTPRC"],
+}
+ALIASES = {"SH2D1B": ["EAT2"], "CMTM2": ["CKLFSF2"], "HAVCR2": ["TIM3"], "TIGIT": ["VSIG9"]}
+
+
+def fetch(name, cache):
+    """Download a UCSC Xena TCGA file once and cache it."""
+    os.makedirs(cache, exist_ok=True)
+    path = os.path.join(cache, name.replace("/", "__"))
+    if not os.path.exists(path):
+        print(f"  downloading {name} ...", flush=True)
+        tmp = path + ".part"
+        with urllib.request.urlopen(XENA + urllib.parse.quote(name, safe=""), timeout=600) as r, open(tmp, "wb") as f:
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+        os.replace(tmp, path)
+    return path
+
+
+def read_expr(path, needed):
+    """Stream a genes x samples matrix keeping only `needed` genes; returns samples x genes."""
+    opener = gzip.open if path.endswith(".gz") else open
+    rows = {}
+    with opener(path, "rt") as f:
+        cols = f.readline().rstrip("\n").split("\t")[1:]
+        for line in f:
+            g, rest = line.split("\t", 1)
+            if g in needed:
+                vals = rest.rstrip("\n").split("\t")
+                try:
+                    rows[g] = np.array(vals, dtype=float)
+                except ValueError:
+                    rows[g] = pd.to_numeric(pd.Series(vals), errors="coerce").values
+    return pd.DataFrame(rows, index=cols)
+
+
+def pick_tumor_samples(index):
+    s = pd.Series(index, index=index)
+    keep = []
+    for _, grp in s.groupby(s.str[:12]):
+        for code in TUMOR_CODES:
+            hit = grp[grp.str[13:15] == code]
+            if len(hit):
+                keep.append(hit.iloc[0])
+                break
+    return keep
+
+
+def parse_stage(series):
+    st = series.astype(str).str.upper()
+    return pd.Series(np.select([st.str.contains("IV"), st.str.contains("III"), st.str.contains("II"),
+                                st.str.contains(r"\bI|STAGE I")], [4, 3, 2, 1], np.nan), index=series.index)
+
+
+def parse_msi(series):
+    s = series.astype(str).str.upper()
+    out = pd.Series(np.nan, index=series.index)
+    out[s.str.contains("MSI-H|MSI_H|MSIH|^H$|HIGH", regex=True)] = 1.0
+    out[s.str.contains("MSS|MSI-L|MSI_L|STABLE|^L$|LOW", regex=True)] = 0.0
+    return out
+
+
+def _tnbc(clin):
+    neg = lambda col: clin[col].eq("Negative") if col in clin else pd.Series(False, index=clin.index)
+    ihc = "lab_proc_her2_neu_immunohistochemistry_receptor_status"
+    her2_neg = neg(ihc) | (~clin.get(ihc, pd.Series(index=clin.index)).eq("Positive")
+                           & neg("lab_procedure_her2_neu_in_situ_hybrid_outcome_type"))
+    return neg("breast_carcinoma_estrogen_receptor_status") & neg("breast_carcinoma_progesterone_receptor_status") & her2_neg
+
+
+SUBSETS = {"BRCA_TNBC": ("BRCA", _tnbc),
+           "BRCA_BASAL": ("BRCA", lambda clin: clin.get("PAM50Call_RNAseq", pd.Series(index=clin.index)).eq("Basal"))}
+
+
+def load_tcga(cohort, cache):
+    """Tumors x (signature genes + age, stage, MSI_H) for one TCGA cohort or clinical subset."""
+    parent, selector = SUBSETS.get(cohort, (cohort, None))
+    needed = {g for v in SIGS.values() for g in v} | {a for v in ALIASES.values() for a in v}
+    expr = read_expr(fetch(f"TCGA.{parent}.sampleMap/HiSeqV2.gz", cache), needed)
+    for g, alts in ALIASES.items():
+        if g not in expr:
+            hit = next((a for a in alts if a in expr), None)
+            if hit:
+                expr = expr.rename(columns={hit: g})
+    clin = pd.read_csv(fetch(f"TCGA.{parent}.sampleMap/{parent}_clinicalMatrix", cache), sep="\t", index_col=0, low_memory=False)
+    expr = expr.loc[pick_tumor_samples(expr.index)]
+    if selector is not None:
+        keep = set(clin.index[selector(clin).fillna(False).astype(bool)])
+        expr = expr.loc[[i for i in expr.index if i in keep]]
+    df = expr.copy()
+    age_col = next((c for c in ["age_at_initial_pathologic_diagnosis", "age"] if c in clin), None)
+    stage_col = next((c for c in ["pathologic_stage", "clinical_stage"] if c in clin), None)
+    msi_col = next((c for c in MSI_COLUMNS if c in clin and clin[c].notna().sum() > 20), None)
+    df["age"] = pd.to_numeric(clin[age_col], errors="coerce").reindex(df.index) if age_col else np.nan
+    df["stage"] = parse_stage(clin[stage_col]).reindex(df.index) if stage_col else np.nan
+    df["MSI_H"] = parse_msi(clin[msi_col]).reindex(df.index) if msi_col else np.nan
+    return df
+
+
+def zscore(s):
+    return (s - s.mean()) / s.std()
+
+
+def add_scores(df):
+    """Signature score = mean z-score (across tumors of the cohort) of its marker genes."""
+    for name, gl in SIGS.items():
+        present = [g for g in gl if g in df and df[g].std() > 0]
+        df[name] = pd.concat([zscore(df[g]) for g in present], axis=1).mean(axis=1) if present else np.nan
+    return df
+
+
+def _norm_patient(x):
+    x = str(x).strip().strip('"').replace(".", "-")
+    return x[:12] if x.upper().startswith("TCGA") else x
+
+
+def load_score_file(path, transpose=False):
+    """Per-sample score table; TCGA ids reduced to patient barcodes, primary tumor (code 01) preferred."""
+    t = pd.read_csv(path, sep="," if path.endswith(".csv") else "\t", index_col=0)
+    if transpose:
+        t = t.T
+    t.index = t.index.map(lambda v: str(v).strip().strip('"'))
+    code = pd.Series([i.replace(".", "-")[13:15] if i.upper().startswith("TCGA") else "01" for i in t.index], index=t.index)
+    t = t.assign(_pat=t.index.map(_norm_patient), _pri=(code != "01").astype(int)).sort_values("_pri")
+    t = t.drop_duplicates("_pat").set_index("_pat").drop(columns="_pri")
+    return t.apply(pd.to_numeric, errors="coerce")
+
+
+def attach_scores(df, score_df):
+    pat = pd.Series(df.index.map(_norm_patient), index=df.index)
+    for c in score_df.columns:
+        df[c] = pat.map(score_df[c]).values
+    return df
+
+
+def partial_spearman(df, x, y, covars):
+    """Rank-based partial correlation: residualize ranks of x and y on ranks of covars, correlate residuals."""
+    d = df[[x, y] + covars].dropna()
+    if len(d) < 20:
+        return np.nan, np.nan
+    r = d.rank()
+    C = np.column_stack([np.ones(len(r))] + [r[c] for c in covars])
+    res = lambda v: v - C @ np.linalg.lstsq(C, v, rcond=None)[0]
+    return stats.pearsonr(res(r[x].values), res(r[y].values))
+
+
+def bh(p):
+    p = np.asarray(p, dtype=float)
+    q = np.full_like(p, np.nan)
+    ok = ~np.isnan(p)
+    if ok.sum():
+        pv = p[ok]
+        order = np.argsort(pv)
+        ranked = np.minimum.accumulate((pv[order] * ok.sum() / (np.arange(ok.sum()) + 1))[::-1])[::-1]
+        tmp = np.empty_like(pv)
+        tmp[order] = np.minimum(ranked, 1)
+        q[ok] = tmp
+    return q
+
 
 LINEAGE_SHORT = {"B.cells": "B", "CD4.T.cells": "CD4", "CD8.T.cells": "CD8", "Dendritic.cells": "DC",
                  "Endothelial.cells": "Endo", "Epithelial.cells": "Epi", "Fibroblasts": "Fibro", "Mast.cells": "Mast",
@@ -74,8 +263,10 @@ SCHEMA = {
         "scores": "TSV, first column sample/patient id (TCGA barcodes in dotted or dashed form accepted), "
                   "one column per state, e.g. CD8_S03 (lineage short name + state)",
         "annotation": "CSV with columns state, lineage, ecotype, top_genes (written by build)",
-        "cohorts": "TCGA codes known to immune_gene_function (COADREAD, LUAD, PAAD, BRCA, HNSC, BLCA, SKCM, "
-                   "BRCA_TNBC, ...); data are downloaded from UCSC Xena on first use into xena_cache/",
+        "cohorts": "TCGA codes on UCSC Xena (COADREAD, LUAD, PAAD, BRCA, HNSC, BLCA, SKCM, ...) or the subsets "
+                   "BRCA_TNBC, BRCA_BASAL; downloaded on first use into xena_cache/",
+        "confounders": "default LEUKOCYTE (PTPRC) + CAF score; --msi adds MSI-H; --adjust accepts age, stage, MSI_H, "
+                       "signature names or score-table columns",
     },
     "outputs": {
         "per_cohort.csv": "query, target, target_type, cohort, n, k_covariates, r",
@@ -146,11 +337,11 @@ def pool(r, n, k):
 
 def run(args):
     os.makedirs(args.out, exist_ok=True)
-    S = igf.load_score_file(args.scores)
+    S = load_score_file(args.scores)
     ann = pd.read_csv(args.annotation).fillna("").set_index("state") if args.annotation and os.path.exists(args.annotation) else None
     queries = list(args.query or []) + ([c for c in S.columns if c.startswith(args.query_prefix)] if args.query_prefix else [])
     queries = list(dict.fromkeys(queries))
-    missing = [q for q in queries if q not in S.columns and q not in igf.SIGS]
+    missing = [q for q in queries if q not in S.columns and q not in SIGS]
     if not queries or missing:
         sys.exit(f"No usable --query/--query-prefix (missing: {missing}). Available states: {list(S.columns)[:20]}...")
     lineage = lambda s: s.split("_", 1)[0] if s in S.columns else None
@@ -164,7 +355,7 @@ def run(args):
     cohort_n = {}
     for c in args.cohorts:
         print(f"[{c}] loading", flush=True)
-        df = igf.attach_scores(igf.add_scores(igf.load_tcga(c, ["PTPRC"], args.cache)), S)
+        df = attach_scores(add_scores(load_tcga(c, args.cache)), S)
         msi = ["MSI_H"] if args.msi and df["MSI_H"].notna().mean() >= 0.7 and df["MSI_H"].nunique() > 1 else []
         cohort_n[c] = int(df[queries[0]].notna().sum()) if queries[0] in df else 0
         for q in queries:
@@ -181,7 +372,7 @@ def run(args):
                 d = df[[q, t] + cov].dropna()
                 if len(d) < args.min_samples:
                     continue
-                r = igf.partial_spearman(d, q, t, cov)[0]
+                r = partial_spearman(d, q, t, cov)[0]
                 per.append(dict(query=q, target=t, target_type=ttype, cohort=c, n=len(d), k_covariates=len(cov),
                                 covariates="+".join(cov), r=r))
         print(f"  {c}: {cohort_n[c]} tumors with query values", flush=True)
@@ -198,7 +389,7 @@ def run(args):
     R = pd.DataFrame(rows)
     R["q"] = np.nan
     for q, idx in R.groupby("query").groups.items():
-        R.loc[idx, "q"] = igf.bh(R.loc[idx, "p"].values)
+        R.loc[idx, "q"] = bh(R.loc[idx, "p"].values)
     eco = (lambda s: ann["ecotype"].get(s, "") if ann is not None and s in ann.index else "")
     R["query_ecotype"] = R["query"].map(lambda s: eco(s) or "")
     R["target_ecotype"] = R["target"].map(lambda s: eco(s) or "")
@@ -264,7 +455,8 @@ def main():
     r.add_argument("--cohorts", nargs="+", default=DEFAULT_COHORTS)
     r.add_argument("--targets", nargs="+", default=["states", "signatures"], choices=["states", "signatures"])
     r.add_argument("--signatures", nargs="*", help=f"signature scores to use (default: {' '.join(DEFAULT_SIGNATURES)})")
-    r.add_argument("--adjust", nargs="*", default=["LEUKOCYTE", "CAF"], help="covariates (default LEUKOCYTE CAF)")
+    r.add_argument("--adjust", nargs="*", default=["LEUKOCYTE", "CAF"],
+                   help="covariates (default LEUKOCYTE CAF); also: age stage MSI_H, any signature, any score column")
     r.add_argument("--msi", action="store_true", help="also adjust for MSI-H where available")
     r.add_argument("--include-same-lineage", action="store_true", help="also correlate with states of the same lineage")
     r.add_argument("--scores", default="cell_states.tsv")

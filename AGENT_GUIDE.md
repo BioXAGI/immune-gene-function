@@ -61,14 +61,17 @@ adar_ifn_check.py, pubmed_*.py, ctgov_notch.py) are separate analyses, not part 
 
 ## Companion tool: state_context.py (cell state -> immune context)
 Links EcoTyper cell states (or any per-sample score table) to immune/stromal signature scores and to other
-cell states in TCGA tumors. Survival-free. Requires `immune_gene_function.py` in the same folder.
+cell states in TCGA tumors. Survival-free. Standalone: needs only numpy, pandas, scipy (downloads TCGA data
+from UCSC Xena on first use).
 - `python state_context.py describe` prints its JSON schema (commands, inputs, outputs, columns, rules).
 - `python state_context.py build --ecotyper-dir <EcoTyper>/Carcinoma/Carcinoma_Fractions/Cell_States/discovery`
   writes `cell_states.tsv` (samples x states, e.g. CD8_S03) and `cell_states_annotation.csv` (ecotype, top genes).
 - `python state_context.py run --query-prefix Epi_ --msi` (or `--query CD8_S03 Epi_S04`) writes `pooled.csv`
   (partial Spearman per target pooled across cohorts: r, 95% CI, p, q, I2), `per_cohort.csv`,
   `ecotype_agreement.csv` and `run_summary.json`.
-Method: partial Spearman adjusted for LEUKOCYTE (PTPRC) + CAF score (+ MSI-H with --msi) per cohort, then
+Method: partial Spearman per cohort adjusted for confounders, by default LEUKOCYTE (PTPRC, total immune
+content) + CAF (FAP, COL1A1, COL1A2, COL3A1, PDGFRB, THBS2; stromal content), + MSI-H with --msi; `--adjust`
+also accepts age, stage, MSI_H, any signature or score column. Then
 Fisher-z DerSimonian-Laird random effects. Read effect size and CI, not p (n is large). Same-lineage states are
 excluded by default (shares within a lineage are compositional). Ecotype agreement is expected by construction in
 TCGA because the ecotypes were defined from these same state abundances.

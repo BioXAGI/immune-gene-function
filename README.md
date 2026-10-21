@@ -8,7 +8,7 @@ cell state from bulk tumor RNA-seq (TCGA via UCSC Xena, or your own data). Per c
   Run `python immune_gene_function.py --describe` for a JSON schema of methods and outputs.
 - `state_context.py`: links EcoTyper cell states (or any per-sample score table) to immune/stromal context and
   to other cell states, pooled across TCGA cohorts with 95% confidence intervals and an ecotype-consistency
-  check. Survival-free. `python state_context.py describe` prints its JSON schema.
+  check. Survival-free and standalone (numpy, pandas, scipy only). `python state_context.py describe` prints its JSON schema.
 - `AGENT_GUIDE.md`: usage and interpretation rules, written for other AI agents and models.
 
 ## Quick start
