@@ -56,4 +56,19 @@ When `--interaction-score` is not CTL, the columns still carry the `CTL` names b
 
 ## Reference
 Jiang P et al. Signatures of T cell dysfunction and exclusion predict cancer immunotherapy response.
-Nat Med 24:1550-1558 (2018).
+Nat Med 24:1550-1558 (2018). Related one-off scripts in this folder (notch_tp53.py, stk11_ptges_luad.py,
+adar_ifn_check.py, pubmed_*.py, ctgov_notch.py) are separate analyses, not part of this pipeline.
+
+## Companion tool: state_context.py (cell state -> immune context)
+Links EcoTyper cell states (or any per-sample score table) to immune/stromal signature scores and to other
+cell states in TCGA tumors. Survival-free. Requires `immune_gene_function.py` in the same folder.
+- `python state_context.py describe` prints its JSON schema (commands, inputs, outputs, columns, rules).
+- `python state_context.py build --ecotyper-dir <EcoTyper>/Carcinoma/Carcinoma_Fractions/Cell_States/discovery`
+  writes `cell_states.tsv` (samples x states, e.g. CD8_S03) and `cell_states_annotation.csv` (ecotype, top genes).
+- `python state_context.py run --query-prefix Epi_ --msi` (or `--query CD8_S03 Epi_S04`) writes `pooled.csv`
+  (partial Spearman per target pooled across cohorts: r, 95% CI, p, q, I2), `per_cohort.csv`,
+  `ecotype_agreement.csv` and `run_summary.json`.
+Method: partial Spearman adjusted for LEUKOCYTE (PTPRC) + CAF score (+ MSI-H with --msi) per cohort, then
+Fisher-z DerSimonian-Laird random effects. Read effect size and CI, not p (n is large). Same-lineage states are
+excluded by default (shares within a lineage are compositional). Ecotype agreement is expected by construction in
+TCGA because the ecotypes were defined from these same state abundances.

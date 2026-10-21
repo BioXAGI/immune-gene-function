@@ -55,6 +55,7 @@ import gzip
 import os
 import sys
 import textwrap
+import time
 import urllib.parse
 import urllib.request
 import warnings
@@ -137,8 +138,18 @@ def read_expr(path, genes_needed):
             g, rest = line.split(sep, 1)
             g = g.strip('"')
             if g in genes_needed:
-                rows[g] = pd.to_numeric(pd.Series(rest.rstrip("\n").split(sep)), errors="coerce").values
+                vals = rest.rstrip("\n").split(sep)
+                try:
+                    rows[g] = np.array(vals, dtype=float)
+                except ValueError:
+                    rows[g] = pd.to_numeric(pd.Series(vals), errors="coerce").values
     return pd.DataFrame(rows, index=[c.strip('"') for c in cols])
+
+
+class AnyGene:
+    """Membership test that accepts every gene symbol (genome-wide scan)."""
+    def __contains__(self, item):
+        return True
 
 
 def genes_needed(genes):
@@ -182,12 +193,31 @@ def parse_msi(series):
     return out
 
 
-def load_tcga(cohort, genes, cache):
-    expr = read_expr(fetch(f"TCGA.{cohort}.sampleMap/HiSeqV2.gz", cache), genes_needed(genes))
-    surv = pd.read_csv(fetch(f"survival/{cohort}_survival.txt", cache), sep="\t", index_col=0)
-    clin = pd.read_csv(fetch(f"TCGA.{cohort}.sampleMap/{cohort}_clinicalMatrix", cache),
+# Clinical subsets usable as cohort names: name -> (parent TCGA cohort, selector on the clinical matrix)
+def _tnbc(clin):
+    neg = lambda col: clin[col].eq("Negative") if col in clin else pd.Series(False, index=clin.index)
+    her2_neg = neg("lab_proc_her2_neu_immunohistochemistry_receptor_status") | (
+        ~clin.get("lab_proc_her2_neu_immunohistochemistry_receptor_status", pd.Series(index=clin.index)).eq("Positive")
+        & neg("lab_procedure_her2_neu_in_situ_hybrid_outcome_type"))
+    return neg("breast_carcinoma_estrogen_receptor_status") & neg("breast_carcinoma_progesterone_receptor_status") & her2_neg
+
+
+SUBSETS = {
+    "BRCA_TNBC": ("BRCA", _tnbc),
+    "BRCA_BASAL": ("BRCA", lambda clin: clin.get("PAM50Call_RNAseq", pd.Series(index=clin.index)).eq("Basal")),
+}
+
+
+def load_tcga(cohort, genes, cache, all_genes=False):
+    parent, selector = SUBSETS.get(cohort, (cohort, None))
+    expr = read_expr(fetch(f"TCGA.{parent}.sampleMap/HiSeqV2.gz", cache), AnyGene() if all_genes else genes_needed(genes))
+    surv = pd.read_csv(fetch(f"survival/{parent}_survival.txt", cache), sep="\t", index_col=0)
+    clin = pd.read_csv(fetch(f"TCGA.{parent}.sampleMap/{parent}_clinicalMatrix", cache),
                        sep="\t", index_col=0, low_memory=False)
     expr = expr.loc[pick_tumor_samples(expr.index)]
+    if selector is not None:
+        keep = set(clin.index[selector(clin).fillna(False).astype(bool)])
+        expr = expr.loc[[i for i in expr.index if i in keep]]
     df = expr.join(surv.drop(columns=[c for c in ["_PATIENT", "Redaction"] if c in surv]), how="left")
     age_col = next((c for c in ["age_at_initial_pathologic_diagnosis", "age"] if c in clin), None)
     stage_col = next((c for c in ["pathologic_stage", "clinical_stage", "ajcc_pathologic_tumor_stage"] if c in clin), None)
@@ -195,7 +225,9 @@ def load_tcga(cohort, genes, cache):
     df["age"] = pd.to_numeric(clin[age_col], errors="coerce").reindex(df.index) if age_col else np.nan
     df["stage"] = parse_stage(clin[stage_col]).reindex(df.index) if stage_col else np.nan
     df["MSI_H"] = parse_msi(clin[msi_col]).reindex(df.index) if msi_col else np.nan
-    return resolve_aliases(df, genes)
+    out = resolve_aliases(df, genes)
+    out.attrs["genes"] = list(expr.columns)
+    return out
 
 
 def load_custom(args, genes):
@@ -214,6 +246,36 @@ def load_custom(args, genes):
     if "cohort" in df:
         return {c: df[df["cohort"] == c] for c in df["cohort"].dropna().unique()}
     return {"CUSTOM": df}
+
+
+# ============================================================================= external scores (e.g. ecotypes)
+def _norm_patient(x):
+    x = str(x).strip().strip('"').replace(".", "-")
+    return x[:12] if x.upper().startswith("TCGA") else x
+
+
+def load_score_file(path, transpose=False):
+    """Table of per-sample scores (e.g. EcoTyper ecotype abundances). First column = sample id.
+    TCGA barcodes in dotted or dashed form are reduced to the 12-character patient id; when a patient has
+    several samples the primary tumor (sample code 01) is kept."""
+    sep = "," if path.endswith(".csv") else "\t"
+    t = pd.read_csv(path, sep=sep, index_col=0)
+    if transpose:
+        t = t.T
+    t.index = t.index.map(lambda v: str(v).strip().strip('"'))
+    code = pd.Series([i.replace(".", "-")[13:15] if i.upper().startswith("TCGA") else "01" for i in t.index], index=t.index)
+    t = t.assign(_pat=t.index.map(_norm_patient), _pri=(code != "01").astype(int)).sort_values("_pri")
+    t = t.drop_duplicates("_pat").set_index("_pat").drop(columns="_pri")
+    return t.apply(pd.to_numeric, errors="coerce")
+
+
+def attach_scores(df, score_df):
+    if score_df is None:
+        return df
+    pat = pd.Series(df.index.map(_norm_patient), index=df.index)
+    for c in score_df.columns:
+        df[c] = pat.map(score_df[c]).values
+    return df
 
 
 # ============================================================================= scores and statistics
@@ -282,34 +344,36 @@ def has_endpoint(df, ep):
 
 
 def cox_interaction(df, gene, time, event, use_msi, extra=(), score="CTL"):
+    """Cox: hazard ~ S + X + S*X + covariates. S = `score` (CTL by default). Internal column names avoid
+    clashes when CTL itself is an extra covariate; output keys keep the historical CTL/CTLxX labels."""
     from lifelines import CoxPHFitter
     base = ["stage", "age", "CAF"] + (["MSI_H"] if use_msi else []) + [e for e in extra if e != score]
-    cov = usable_covariates(df, list(dict.fromkeys(base)))
-    d = df[[time, event, score, gene] + cov].dropna().rename(columns={score: "CTL"})
+    cov = [c for c in usable_covariates(df, list(dict.fromkeys(base))) if c != gene]
+    d = df[[time, event] + list(dict.fromkeys([score, gene] + cov))].dropna()
     d = d[d[time] > 0].copy()
     out = {"n": len(d), "events": int(d[event].sum()) if len(d) else 0, "covariates": "+".join(cov)}
-    if out["events"] < MIN_EVENTS or d[gene].std() == 0:
+    if out["events"] < MIN_EVENTS or d[gene].std() == 0 or d[score].std() == 0:
         return out
-    d["CTL"], d["X"] = zscore(d["CTL"]), zscore(d[gene])
-    d["CTLxX"] = d["CTL"] * d["X"]
+    d["_S"], d["_X"] = zscore(d[score]), zscore(d[gene])
+    d["_SxX"] = d["_S"] * d["_X"]
     try:
-        s = CoxPHFitter(penalizer=0.01).fit(d[[time, event, "CTL", "X", "CTLxX"] + cov], time, event).summary
-        for term in ["X", "CTL", "CTLxX"]:
-            out[f"logHR_{term}"] = s.loc[term, "coef"]
-            out[f"se_{term}"] = s.loc[term, "se(coef)"]
-            out[f"HR_{term}"] = s.loc[term, "exp(coef)"]
-            out[f"p_{term}"] = s.loc[term, "p"]
-        hi = d["X"] >= d["X"].median()
+        s = CoxPHFitter(penalizer=0.01).fit(d[[time, event, "_S", "_X", "_SxX"] + cov], time, event).summary
+        for term, lab in [("_X", "X"), ("_S", "CTL"), ("_SxX", "CTLxX")]:
+            out[f"logHR_{lab}"] = s.loc[term, "coef"]
+            out[f"se_{lab}"] = s.loc[term, "se(coef)"]
+            out[f"HR_{lab}"] = s.loc[term, "exp(coef)"]
+            out[f"p_{lab}"] = s.loc[term, "p"]
+        hi = d["_X"] >= d["_X"].median()
         for lab, sub in [("Xlow", d[~hi]), ("Xhigh", d[hi])]:
-            ss = CoxPHFitter(penalizer=0.01).fit(sub[[time, event, "CTL"] + cov], time, event).summary
-            out[f"HR_CTL_{lab}"] = ss.loc["CTL", "exp(coef)"]
-            out[f"p_CTL_{lab}"] = ss.loc["CTL", "p"]
+            ss = CoxPHFitter(penalizer=0.01).fit(sub[[time, event, "_S"] + cov], time, event).summary
+            out[f"HR_CTL_{lab}"] = ss.loc["_S", "exp(coef)"]
+            out[f"p_CTL_{lab}"] = ss.loc["_S", "p"]
     except Exception as e:
         out["error"] = str(e)[:80]
     return out
 
 
-def score_prognosis(name, df, endpoints, use_msi):
+def score_prognosis(name, df, endpoints, use_msi, extra_scores=()):
     """Independent prognostic value of each signature score, without and with CTL."""
     from lifelines import CoxPHFitter
     msi = ["MSI_H"] if use_msi else []
@@ -317,7 +381,7 @@ def score_prognosis(name, df, endpoints, use_msi):
     for ep in endpoints:
         if not has_endpoint(df, ep):
             continue
-        for s in PROGNOSIS_SCORES:
+        for s in list(PROGNOSIS_SCORES) + list(extra_scores):
             for extra in ([], ["CTL"]):
                 if s in extra:
                     continue
@@ -486,6 +550,178 @@ def km_panel(df, cohort, gene, ep, score, path):
     plt.close(fig)
 
 
+# ============================================================================= genome-wide scan
+CTL_GENES = set(SIGS["CTL"])
+SCAN_CONTROLS_POS = ["IDO1", "TGFB1", "PDCD1LG2", "CD274", "SERPINB9", "IL10", "LGALS9", "CD47", "PTPN2", "VSIR"]
+SCAN_CONTROLS_NEG = ["ACTB", "GAPDH", "TBP", "PGK1", "PPIA", "RPLP0", "HPRT1", "POLR2A"]
+
+
+def _scan_chunk(task):
+    """Worker: Cox interaction for a block of genes. Module-level so it can be pickled."""
+    from lifelines import CoxPHFitter
+    names, G, T, E, zc, C, cov_names, time_col, ev_col = task
+    out = []
+    base = pd.DataFrame(C, columns=cov_names)
+    base[time_col], base[ev_col], base["CTL"] = T, E, zc
+    for i, g in enumerate(names):
+        x = G[:, i]
+        sd = x.std()
+        if not sd > 0:
+            continue
+        zx = (x - x.mean()) / sd
+        d = base.copy()
+        d["X"], d["CTLxX"] = zx, zc * zx
+        try:
+            sm = CoxPHFitter(penalizer=0.01).fit(d, time_col, ev_col).summary
+        except Exception:
+            continue
+        out.append((g, float(np.median(x)), sm.loc["CTLxX", "coef"], sm.loc["CTLxX", "se(coef)"],
+                    sm.loc["CTLxX", "p"], sm.loc["X", "coef"], sm.loc["X", "se(coef)"], sm.loc["X", "p"]))
+    return out
+
+
+def scan_cohort(name, df, ep, use_msi, min_expr, workers, score="CTL"):
+    from concurrent.futures import ProcessPoolExecutor
+    from lifelines import CoxPHFitter
+    T = f"{ep}.time"
+    cov = usable_covariates(df, ["stage", "age", "CAF"] + (["MSI_H"] if use_msi else []))
+    base = df[[T, ep, score] + [c for c in cov if c != score]].dropna()
+    cov = [c for c in cov if c != score]
+    base = base[base[T] > 0]
+    ev = int(base[ep].sum())
+    if ev < MIN_EVENTS:
+        return None, dict(cohort=name, n=len(base), events=ev, note="too few events")
+    zc = zscore(base[score]).values
+    ctl_hr = CoxPHFitter(penalizer=0.01).fit(base.assign(**{score: zc})[[T, ep, score] + cov], T, ep).summary.loc[score]
+    skip = CTL_GENES if score == "CTL" else set()
+    genes = [g for g in df.attrs["genes"] if g not in skip and g in df and df.loc[base.index, g].median() >= min_expr
+             and df.loc[base.index, g].std() > 0]
+    G = df.loc[base.index, genes].values.astype(float)
+    C = base[cov].values.astype(float)
+    nchunk = max(workers * 4, 1)
+    tasks = [(genes[i::nchunk], G[:, i::nchunk], base[T].values, base[ep].values, zc, C, cov, T, ep)
+             for i in range(nchunk) if len(genes[i::nchunk])]
+    rows = []
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for r in ex.map(_scan_chunk, tasks):
+                rows += r
+    else:
+        for t in tasks:
+            rows += _scan_chunk(t)
+    res = pd.DataFrame(rows, columns=["gene", "median_expr", "logHR_CTLxX", "se_CTLxX", "p_CTLxX",
+                                      "logHR_X", "se_X", "p_X"])
+    res["z_CTLxX"] = res["logHR_CTLxX"] / res["se_CTLxX"]
+    res["HR_CTLxX"] = np.exp(res["logHR_CTLxX"])
+    res["q_CTLxX"] = bh(res["p_CTLxX"])
+    res.insert(0, "cohort", name)
+    lam = float(np.median(res["z_CTLxX"] ** 2) / 0.4549)
+    info = dict(cohort=name, score=score, n=len(base), events=ev, genes_tested=len(res), covariates="+".join(cov),
+                CTL_HR=float(ctl_hr["exp(coef)"]), CTL_p=float(ctl_hr["p"]), lambda_inflation=lam,
+                n_q_lt_0_1=int((res["q_CTLxX"] < 0.1).sum()), frac_q_lt_0_1=float((res["q_CTLxX"] < 0.1).mean()))
+    return res, info
+
+
+def run_scan(args):
+    os.makedirs(args.out, exist_ok=True)
+    workers = args.scan_workers or max(1, min(8, (os.cpu_count() or 2) - 2))
+    cohorts = TCGA_COHORTS if args.cohorts == ["ALL"] else args.cohorts
+    dfs, results, infos = {}, {}, []
+    for ep in args.scan_endpoints:
+        results[ep] = []
+    for c in cohorts:
+        print(f"[{c}] loading all genes", flush=True)
+        try:
+            df = attach_scores(add_scores(load_tcga(c, [], args.cache, all_genes=True)), SCORE_DF)
+        except Exception as e:
+            print(f"  skipped {c}: {e}")
+            continue
+        dfs[c] = df
+        has_msi = args.msi and df["MSI_H"].notna().mean() >= 0.7 and df["MSI_H"].nunique() > 1
+        for ep in args.scan_endpoints:
+            t0 = time.time()
+            res, info = scan_cohort(c, df, ep, has_msi, args.scan_min_expr, workers, args.interaction_score)
+            info["endpoint"] = ep
+            infos.append(info)
+            if res is None:
+                print(f"  {c} {ep}: skipped ({info['note']}, {info['events']} events)")
+                continue
+            res.to_csv(os.path.join(args.out, f"scan_{c}_{ep}.csv"), index=False, float_format="%.5g")
+            results[ep].append(res)
+            print(f"  {c} {ep}: {info['genes_tested']} genes, {info['events']} events, {args.interaction_score} HR={info['CTL_HR']:.2f} "
+                  f"(p={info['CTL_p']:.2f}), lambda={info['lambda_inflation']:.2f}, FDR<0.1: {info['n_q_lt_0_1']} "
+                  f"[{time.time()-t0:.0f}s]", flush=True)
+    pd.DataFrame(infos).to_csv(os.path.join(args.out, "scan_cohort_summary.csv"), index=False, float_format="%.4g")
+
+    for ep, lst in results.items():
+        if not lst:
+            continue
+        if len(lst) < 2:
+            print(f"\n{ep}: one cohort only, so no pooled meta-analysis; see scan_<cohort>_{ep}.csv")
+            continue
+        allr = pd.concat(lst)
+        meta_rows = []
+        for g, grp in allr.groupby("gene"):
+            if len(grp) < 2:
+                continue
+            mm = meta(grp["logHR_CTLxX"].values, grp["se_CTLxX"].values)
+            if "p_random" in mm:
+                meta_rows.append(dict(gene=g, k=mm["k"], HR_random=mm["HR_random"], CI_low=mm["CI_low"], CI_high=mm["CI_high"],
+                                      p_random=mm["p_random"], I2=mm["I2"], n_cohorts_p_lt_0_05=int((grp["p_CTLxX"] < 0.05).sum()),
+                                      n_same_direction=int((np.sign(grp["logHR_CTLxX"]) == np.sign(np.log(mm["HR_random"]))).sum()),
+                                      median_expr=float(grp["median_expr"].median())))
+        mt = pd.DataFrame(meta_rows).sort_values("p_random")
+        mt["q_random"] = bh(mt["p_random"])
+        mt["rank_dysfunction"] = np.nan
+        up = mt[mt["HR_random"] > 1].sort_values("p_random")
+        mt.loc[up.index, "rank_dysfunction"] = np.arange(1, len(up) + 1)
+        # annotate hits with partial correlations (adjusted for leukocyte + CAF [+ MSI-H]) in each cohort
+        hits = pd.concat([up.head(args.scan_top), mt[mt["HR_random"] < 1].head(args.scan_top // 2)])["gene"].tolist()
+        ann = []
+        for g in hits:
+            r = {"gene": g}
+            for s_ in ["CTL", "EXHAUSTION", "TREG", "M2_LIKE", "NEUTROPHIL", "CAF", "ENDOTHELIAL"]:
+                vals = []
+                for c, df in dfs.items():
+                    if g in df:
+                        msi = ["MSI_H"] if (args.msi and df["MSI_H"].notna().mean() >= 0.7 and df["MSI_H"].nunique() > 1) else []
+                        gf = gene_frame(df, g, ["LEUKOCYTE", "CAF", s_] + msi)
+                        if s_ in gf:
+                            vals.append(partial_spearman(gf, g, s_, [c_ for c_ in ["LEUKOCYTE", "CAF"] + msi if c_ != s_])[0])
+                r[f"pcorr_{s_}_median"] = float(np.nanmedian(vals)) if vals else np.nan
+            ann.append(r)
+        mt = mt.merge(pd.DataFrame(ann), on="gene", how="left")
+        mt.to_csv(os.path.join(args.out, f"scan_meta_{ep}.csv"), index=False, float_format="%.5g")
+
+        print(f"\n===== {ep}: genome-wide CTL x gene scan, pooled across {len(lst)} cohorts ({len(mt)} genes) =====")
+        print(f"Calibration: median lambda across cohorts = {np.median([i['lambda_inflation'] for i in infos if i['endpoint']==ep and 'lambda_inflation' in i]):.2f} (1.0 = null)")
+        print(f"Genes with pooled FDR<0.1: dysfunction-like (HR>1) {int(((mt.q_random<0.1)&(mt.HR_random>1)).sum())}, "
+              f"opposite (HR<1) {int(((mt.q_random<0.1)&(mt.HR_random<1)).sum())}")
+        print("\nPositive and negative controls (pooled):")
+        for g in SCAN_CONTROLS_POS + SCAN_CONTROLS_NEG:
+            x = mt[mt.gene == g]
+            if len(x):
+                r = x.iloc[0]
+                print(f"  {g:9s} {'pos' if g in SCAN_CONTROLS_POS else 'neg'}  HR={r.HR_random:.2f} p={r.p_random:.3g} q={r.q_random:.2g} "
+                      f"rank(HR>1)={'' if pd.isna(r.rank_dysfunction) else int(r.rank_dysfunction)}/{len(up)}")
+        pos = mt[mt.gene.isin(SCAN_CONTROLS_POS)]["p_random"]
+        z = lambda df_: np.log(df_.HR_random) / ((np.log(df_.CI_high) - np.log(df_.CI_low)) / 3.92)
+        sc = z(mt).rename("z")
+        zpos, zneg = sc[mt.gene.isin(SCAN_CONTROLS_POS)], sc[mt.gene.isin(SCAN_CONTROLS_NEG)]
+        if len(zpos) and len(zneg):
+            auc = np.mean([(a > b) + 0.5 * (a == b) for a in zpos for b in zneg])
+            print(f"Control AUC (positives vs negatives, pooled z): {auc:.2f} (n={len(zpos)} vs {len(zneg)})")
+        cols = ["gene", "HR_random", "p_random", "q_random", "k", "n_same_direction", "I2", "pcorr_CTL_median",
+                "pcorr_EXHAUSTION_median", "pcorr_CAF_median", "pcorr_M2_LIKE_median"]
+        print(f"\nTop dysfunction-like genes (pooled HR>1):")
+        print(up.merge(mt[["gene"] + [c for c in cols if c not in up.columns and c != 'gene']], on="gene", how="left")
+              .head(30)[[c for c in cols if c in mt.columns or c in up.columns]].round(3).to_string(index=False)
+              if False else mt[mt["HR_random"] > 1].head(30)[cols].round(3).to_string(index=False))
+        print(f"\nTop opposite genes (HR<1, enhance CTL benefit):")
+        print(mt[mt["HR_random"] < 1].head(15)[cols].round(3).to_string(index=False))
+    print(f"\nOutputs in {args.out}/ (scan_*.csv)")
+
+
 # ============================================================================= self-description
 SCHEMA = {
     "purpose": "Infer whether a gene is linked to T-cell dysfunction, T-cell exclusion, or a specific "
@@ -597,14 +833,25 @@ def parse_args():
     g = ap.add_argument_group("survival")
     g.add_argument("--no-survival", action="store_true", help="correlations only")
     g.add_argument("--endpoints", nargs="+", default=["OS", "PFI"])
-    g.add_argument("--interaction-score", default="CTL", choices=list(SIGS),
+    g.add_argument("--interaction-score", default="CTL",
                    help="score whose survival effect is tested for modification by the gene")
-    g.add_argument("--adjust-scores", nargs="*", default=[], choices=list(SIGS),
+    g.add_argument("--adjust-scores", nargs="*", default=[],
                    help="extra Cox covariates, e.g. M2_LIKE TREG (sensitivity; may be mediators)")
     g.add_argument("--score-prognosis", action="store_true",
                    help="also test each signature score as an independent prognostic factor")
     g.add_argument("--km", nargs="*", default=None, metavar="GENE",
                    help="Kaplan-Meier panels for these genes (flag alone = all genes)")
+    g = ap.add_argument_group("external scores")
+    g.add_argument("--score-file", help="table of per-sample scores (e.g. EcoTyper ecotype abundances); "
+                                        "columns become usable in --interaction-score, --adjust-scores, --score-prognosis")
+    g.add_argument("--score-transpose", action="store_true", help="score file has scores as rows and samples as columns")
+    g = ap.add_argument_group("genome-wide scan")
+    g.add_argument("--scan", action="store_true",
+                   help="test every expressed gene for the CTL x gene interaction; ignores --genes")
+    g.add_argument("--scan-endpoints", nargs="+", default=["OS"], help="endpoints to scan (default OS)")
+    g.add_argument("--scan-min-expr", type=float, default=1.0, help="minimum median log2 expression (default 1.0)")
+    g.add_argument("--scan-top", type=int, default=100, help="hits annotated with partial correlations (default 100)")
+    g.add_argument("--scan-workers", type=int, default=0, help="parallel processes (default: cores-2, max 8)")
     g.add_argument("--describe", action="store_true",
                    help="print the JSON schema of methods, columns, files and interpretation rules, then exit")
     args = ap.parse_args()
@@ -616,8 +863,22 @@ def parse_args():
     return args
 
 
+SCORE_DF = None
+
+
 def main():
+    global SCORE_DF
     args = parse_args()
+    if args.score_file:
+        SCORE_DF = load_score_file(args.score_file, args.score_transpose)
+        print(f"Loaded {SCORE_DF.shape[1]} external scores for {len(SCORE_DF)} patients: {list(SCORE_DF.columns)[:12]}")
+    known = set(SIGS) | (set(SCORE_DF.columns) if SCORE_DF is not None else set())
+    for name in [args.interaction_score] + list(args.adjust_scores):
+        if name not in known:
+            sys.exit(f"Unknown score '{name}'. Built-in: {sorted(SIGS)}; supply more with --score-file.")
+    if args.scan:
+        run_scan(args)
+        return
     genes = list(args.genes)
     if args.gene_file:
         genes += [l.strip() for l in open(args.gene_file) if l.strip() and not l.startswith("#")]
@@ -647,14 +908,15 @@ def main():
 
     all_res, prog_rows = [], []
     for name, df in datasets.items():
-        df = add_scores(df)
+        df = attach_scores(add_scores(df), SCORE_DF)
         missing = [g for g in genes if g not in df]
         print(f"[{name}] {len(df)} tumors" + (f"; genes not found: {missing}" if missing else ""), flush=True)
         res, has_msi = analyze_cohort(name, df, genes, args, decomp_scores, decomp_rows)
         if not res.empty:
             all_res.append(res)
         if args.score_prognosis:
-            prog_rows += score_prognosis(name, df, args.endpoints, has_msi)
+            prog_rows += score_prognosis(name, df, args.endpoints, has_msi,
+                                         list(SCORE_DF.columns) if SCORE_DF is not None else ())
         for g in km_genes:
             if g in df and args.endpoints:
                 km_panel(df, name, g, args.endpoints[0], args.interaction_score,
