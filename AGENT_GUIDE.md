@@ -75,3 +75,16 @@ also accepts age, stage, MSI_H, any signature or score column. Then
 Fisher-z DerSimonian-Laird random effects. Read effect size and CI, not p (n is large). Same-lineage states are
 excluded by default (shares within a lineage are compositional). Ecotype agreement is expected by construction in
 TCGA because the ecotypes were defined from these same state abundances.
+Hypothesis signatures: `--signature NAME=G1,G2,...` (repeatable), `--signature-file` (GMT or name/gene table) and
+`--genes G1 G2` add user-defined targets, scored as the mean z-score of member genes present in each cohort.
+Check `signature_coverage.csv` (genes found per cohort), `marker_overlap` (target genes that are also the query
+state's EcoTyper markers: correlation partly by construction) and `covariate_overlap` (target genes that are also
+confounder genes: partly adjusted away). Example:
+`python state_context.py run --query Epi_S03 --signature "TGFB_RESP=SERPINE1,TGFBI,SMAD7,PMEPA1" --genes PDCD1`
+Precomputed signature scores (ssGSEA, GSVA, singscore, published per-sample scores): `--signature-scores TABLE`
+(rows = samples/patients, columns = signatures; `--signature-scores-transpose` if transposed) adds targets named
+`NAME@pre`. If NAME also has a gene list (`--signature` or a built-in signature), `--signature-method` decides:
+`compare` (default; tests both and writes `score_method_comparison.csv` with r for each method, CIs, `cis_overlap`
+and the Spearman agreement between the two scores per cohort), `precomputed` (precomputed only) or `meanz`
+(mean z-score only). Treat a result as robust when the two methods' CIs overlap; agreement below ~0.7 means the
+conclusion depends on the scoring method.

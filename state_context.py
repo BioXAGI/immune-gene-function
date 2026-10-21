@@ -22,6 +22,17 @@ Method (run)
      Confounders adjusted (default): LEUKOCYTE = PTPRC expression (total immune content) and CAF = mean z of
      FAP, COL1A1, COL1A2, COL3A1, PDGFRB, THBS2 (stromal content); MSI-H with --msi. --adjust also accepts
      age, stage, MSI_H, any signature name, or any column of the score table.
+  1b. Hypothesis signatures (--signature NAME=G1,G2,... or --signature-file GMT/TSV) and single genes
+     (--genes) are scored like the built-in signatures (mean z-score of the member genes present in the
+     cohort) and tested as extra targets. Overlap with the query state's marker genes and with the
+     confounder genes is reported, because overlap makes a correlation partly true by construction.
+  1c. Precomputed signature scores (--signature-scores, e.g. ssGSEA/GSVA/singscore or published per-sample
+     scores) are matched to tumors by patient barcode and tested as targets named NAME@pre. When NAME also
+     exists as a gene list (--signature or a built-in signature), --signature-method decides:
+       compare (default)  test both the precomputed score and the mean z-score, and report how well the two
+                          scoring methods agree (Spearman per cohort) in score_method_comparison.csv
+       precomputed        use only the precomputed score
+       meanz              use only the mean z-score of the gene list
   2. Partial Spearman: rank query, target and covariates; regress query ranks and target ranks on
      covariate ranks; correlate the residuals. Default covariates: LEUKOCYTE (PTPRC), CAF score,
      plus MSI-H with --msi where available. A covariate equal to the target is dropped.
@@ -156,10 +167,10 @@ SUBSETS = {"BRCA_TNBC": ("BRCA", _tnbc),
            "BRCA_BASAL": ("BRCA", lambda clin: clin.get("PAM50Call_RNAseq", pd.Series(index=clin.index)).eq("Basal"))}
 
 
-def load_tcga(cohort, cache):
-    """Tumors x (signature genes + age, stage, MSI_H) for one TCGA cohort or clinical subset."""
+def load_tcga(cohort, cache, extra_genes=()):
+    """Tumors x (signature genes + extra genes + age, stage, MSI_H) for one TCGA cohort or clinical subset."""
     parent, selector = SUBSETS.get(cohort, (cohort, None))
-    needed = {g for v in SIGS.values() for g in v} | {a for v in ALIASES.values() for a in v}
+    needed = {g for v in SIGS.values() for g in v} | {a for v in ALIASES.values() for a in v} | set(extra_genes)
     expr = read_expr(fetch(f"TCGA.{parent}.sampleMap/HiSeqV2.gz", cache), needed)
     for g, alts in ALIASES.items():
         if g not in expr:
@@ -262,16 +273,26 @@ SCHEMA = {
     "inputs": {
         "scores": "TSV, first column sample/patient id (TCGA barcodes in dotted or dashed form accepted), "
                   "one column per state, e.g. CD8_S03 (lineage short name + state)",
-        "annotation": "CSV with columns state, lineage, ecotype, top_genes (written by build)",
+        "annotation": "CSV with columns state, lineage, ecotype, top_genes, markers (all marker genes; written by build)",
         "cohorts": "TCGA codes on UCSC Xena (COADREAD, LUAD, PAAD, BRCA, HNSC, BLCA, SKCM, ...) or the subsets "
                    "BRCA_TNBC, BRCA_BASAL; downloaded on first use into xena_cache/",
         "confounders": "default LEUKOCYTE (PTPRC) + CAF score; --msi adds MSI-H; --adjust accepts age, stage, MSI_H, "
                        "signature names or score-table columns",
+        "hypothesis_signatures": "--signature NAME=G1,G2,... (repeatable), --signature-file (GMT or name/gene table), "
+                                 "--genes G1 G2; scored as the mean z-score of member genes present in each cohort",
+        "precomputed_scores": "--signature-scores TABLE (e.g. ssGSEA/GSVA/singscore); targets named NAME@pre; "
+                              "--signature-method compare|precomputed|meanz when NAME also has a gene list",
     },
     "outputs": {
-        "per_cohort.csv": "query, target, target_type, cohort, n, k_covariates, r",
+        "per_cohort.csv": "query, target, target_type (state, signature, custom, gene), cohort, n, k_covariates, r",
+        "signature_coverage.csv": "for hypothesis signatures/genes: genes found per cohort and missing genes; for "
+                                  "precomputed scores: tumors with a score",
+        "score_method_comparison.csv": "(compare mode) per signature and query: pooled r with mean z-score vs "
+                                       "precomputed score, CIs, difference, same_sign, cis_overlap, and method agreement "
+                                       "(Spearman between the two scores, median/min/max across cohorts)",
         "pooled.csv": "query, target, target_type, target_ecotype, same_ecotype, k_cohorts, r_pooled, ci_low, ci_high, "
-                      "p, q, I2, r_median, r_min, r_max, n_positive",
+                      "p, q, I2, r_median, r_min, r_max, n_positive, marker_overlap (target genes among the query state's "
+                      "marker genes), covariate_overlap (target genes among confounder genes)",
         "ecotype_agreement.csv": "query, query_ecotype, n_partners, n_states, auc, mwu_p, partner_ranks, "
                                  "partners_ci_above_0",
         "run_summary.json": "command, cohorts with n, and for each query: top positive/negative targets with CI and "
@@ -282,7 +303,14 @@ SCHEMA = {
         "Treat |r| < 0.1 as negligible even when significant; |r| 0.2-0.3 modest; >= 0.4 strong.",
         "High I2 means cohorts disagree; inspect per_cohort.csv.",
         "Ecotype agreement near AUC 1 is expected by construction for EcoTyper states analysed in TCGA.",
-        "Signature targets that share genes with the query state's markers are partly correlated by construction.",
+        "Signature targets that share genes with the query state's markers are partly correlated by construction "
+        "(see marker_overlap).",
+        "A hypothesis signature sharing genes with a confounder (covariate_overlap) is partly adjusted away; drop the "
+        "overlapping genes or the confounder and compare.",
+        "Check signature_coverage.csv: a signature with few genes found in a cohort is unreliable there.",
+        "In compare mode, conclusions are robust when the two scoring methods have overlapping CIs (cis_overlap; "
+        "same_sign is uninformative when both r are near 0); "
+        "low method agreement (Spearman < 0.7) means the result depends on how the signature is scored.",
     ],
 }
 
@@ -306,7 +334,9 @@ def build(args):
             st = s.split("_", 1)[1]
             top = gi[gi["State"] == st].sort_values("MaxFC", ascending=False).index[:8].tolist() if gi is not None else []
             ce = eco[(eco["CellType"] == lin) & (eco["State"] == st)]["Ecotype"].tolist() if eco is not None else []
-            ann.append(dict(state=s, lineage=lin, ecotype=ce[0] if ce else "", top_genes=", ".join(top)))
+            allm = gi[gi["State"] == st].index.tolist() if gi is not None else []
+            ann.append(dict(state=s, lineage=lin, ecotype=ce[0] if ce else "", top_genes=", ".join(top),
+                            markers=", ".join(allm)))
     T = pd.concat(rows, axis=1)
     T.index.name = "sample"
     T.to_csv(f"{args.out_prefix}.tsv", sep="\t", float_format="%.5g")
@@ -335,6 +365,33 @@ def pool(r, n, k):
                 r_median=float(np.median(r)), r_min=float(r.min()), r_max=float(r.max()), n_positive=int((r > 0).sum()))
 
 
+CONFOUNDER_GENES = {"LEUKOCYTE": set(SIGS["LEUKOCYTE"]), "CAF": set(SIGS["CAF"])}
+
+
+def parse_signatures(args):
+    """Hypothesis signatures from --signature NAME=G1,G2 and --signature-file (GMT: name, description, genes...;
+    or two-column TSV/CSV: name, gene). Returns {name: [genes]}."""
+    sigs = {}
+    for item in args.signature or []:
+        if "=" not in item:
+            sys.exit(f"--signature expects NAME=GENE1,GENE2,... (got '{item}')")
+        name, genes = item.split("=", 1)
+        sigs[name.strip()] = [g.strip() for g in genes.replace(";", ",").split(",") if g.strip()]
+    if args.signature_file:
+        lines = [l.rstrip("\n") for l in open(args.signature_file, encoding="utf-8") if l.strip() and not l.startswith("#")]
+        sep = "\t" if "\t" in lines[0] else ","
+        fields = [l.split(sep) for l in lines]
+        if all(len(f) == 2 for f in fields):
+            for name, g in fields:
+                if name.lower() in ("name", "signature", "set") and g.lower() in ("gene", "symbol"):
+                    continue
+                sigs.setdefault(name.strip(), []).append(g.strip())
+        else:
+            for f in fields:
+                sigs[f[0].strip()] = [g.strip() for g in f[2:] if g.strip()]
+    return {k: list(dict.fromkeys(v)) for k, v in sigs.items() if v}
+
+
 def run(args):
     os.makedirs(args.out, exist_ok=True)
     S = load_score_file(args.scores)
@@ -350,12 +407,56 @@ def run(args):
         targets += [("state", c) for c in S.columns]
     if "signatures" in args.targets:
         targets += [("signature", s) for s in (args.signatures or DEFAULT_SIGNATURES)]
+    custom = parse_signatures(args)
+    single = list(dict.fromkeys(args.genes or []))
+    clash = [n for n in list(custom) + single if n in SIGS or n in S.columns or n in ("age", "stage", "MSI_H")]
+    if clash:
+        sys.exit(f"Names clash with built-in scores, state columns or covariates: {clash}; rename them.")
+    targets += [("custom", n) for n in custom] + [("gene", g) for g in single]
+    extra_genes = {g for v in custom.values() for g in v} | set(single)
+    coverage = []
+    pre = load_score_file(args.signature_scores, args.signature_scores_transpose) if args.signature_scores else None
+    matched = []
+    if pre is not None:
+        bad = [c for c in pre.columns if c in S.columns]
+        if bad:
+            sys.exit(f"--signature-scores columns clash with state columns: {bad}")
+        listed = set(custom) | {t for tt, t in targets if tt == "signature"} | set(SIGS)
+        matched = [c for c in pre.columns if c in listed]
+        if args.signature_method == "meanz":
+            pre = pre[[c for c in pre.columns if c not in matched]]
+            matched = []
+        elif args.signature_method == "precomputed":
+            targets = [(tt, t) for tt, t in targets if not (tt in ("signature", "custom") and t in matched)]
+        targets += [("precomputed", f"{c}@pre") for c in pre.columns]
+        print(f"Precomputed scores: {list(pre.columns)} for {len(pre)} patients; with a matching gene list: {matched} "
+              f"(method: {args.signature_method})")
+    compare_rows = []
 
     per = []
     cohort_n = {}
     for c in args.cohorts:
         print(f"[{c}] loading", flush=True)
-        df = attach_scores(add_scores(load_tcga(c, args.cache)), S)
+        df = attach_scores(add_scores(load_tcga(c, args.cache, extra_genes)), S)
+        for name, genes in custom.items():
+            have = [g for g in genes if g in df and df[g].std() > 0]
+            coverage.append(dict(signature=name, cohort=c, genes_found=len(have), genes_total=len(genes),
+                                 missing=",".join(g for g in genes if g not in have)))
+            df[name] = pd.concat([zscore(df[g]) for g in have], axis=1).mean(axis=1) if have else np.nan
+        for g in single:
+            if g not in df:
+                coverage.append(dict(signature=g, cohort=c, genes_found=0, genes_total=1, missing=g))
+        if pre is not None:
+            df = attach_scores(df, pre.rename(columns=lambda x: f"{x}@pre"))
+            for x in pre.columns:
+                coverage.append(dict(signature=f"{x}@pre", cohort=c, genes_found=np.nan, genes_total=np.nan,
+                                     missing=f"tumors with score: {int(df[f'{x}@pre'].notna().sum())}/{len(df)}"))
+            for x in matched:
+                if args.signature_method == "compare" and x in df:
+                    d2 = df[[x, f"{x}@pre"]].dropna()
+                    if len(d2) >= 20:
+                        compare_rows.append(dict(signature=x, cohort=c, n=len(d2),
+                                                 spearman_meanz_vs_precomputed=stats.spearmanr(d2[x], d2[f"{x}@pre"])[0]))
         msi = ["MSI_H"] if args.msi and df["MSI_H"].notna().mean() >= 0.7 and df["MSI_H"].nunique() > 1 else []
         cohort_n[c] = int(df[queries[0]].notna().sum()) if queries[0] in df else 0
         for q in queries:
@@ -394,6 +495,34 @@ def run(args):
     R["query_ecotype"] = R["query"].map(lambda s: eco(s) or "")
     R["target_ecotype"] = R["target"].map(lambda s: eco(s) or "")
     R["same_ecotype"] = (R["query_ecotype"] != "") & (R["query_ecotype"] == R["target_ecotype"])
+    members = {**{k: set(v) for k, v in SIGS.items()}, **{k: set(v) for k, v in custom.items()}, **{g: {g} for g in single}}
+    members.update({f"{k}@pre": members[k] for k in matched if k in members})
+    mcol = "markers" if ann is not None and "markers" in ann else "top_genes"
+    markers = (lambda q: set(x.strip() for x in str(ann[mcol].get(q, "")).split(",") if x.strip())
+               if ann is not None and mcol in ann and q in ann.index else set())
+    R["marker_overlap"] = [",".join(sorted(members.get(t, set()) & markers(q))) for q, t in zip(R["query"], R["target"])]
+    used = lambda t: set().union(*[CONFOUNDER_GENES.get(c, set()) for c in args.adjust if c != t])
+    R["covariate_overlap"] = [",".join(sorted(members.get(t, set()) & used(t))) for t in R["target"]]
+    if coverage:
+        pd.DataFrame(coverage).to_csv(os.path.join(args.out, "signature_coverage.csv"), index=False)
+    if compare_rows:
+        C = pd.DataFrame(compare_rows)
+        side = []
+        for x in matched:
+            a = R[R["target"] == x].set_index("query")
+            b = R[R["target"] == f"{x}@pre"].set_index("query")
+            for q in a.index.intersection(b.index):
+                side.append(dict(signature=x, query=q, r_meanz=a.loc[q, "r_pooled"], ci_meanz=f"[{a.loc[q, 'ci_low']:.3f}, {a.loc[q, 'ci_high']:.3f}]",
+                                 r_precomputed=b.loc[q, "r_pooled"], ci_precomputed=f"[{b.loc[q, 'ci_low']:.3f}, {b.loc[q, 'ci_high']:.3f}]",
+                                 difference=b.loc[q, "r_pooled"] - a.loc[q, "r_pooled"],
+                                 same_sign=bool(np.sign(a.loc[q, "r_pooled"]) == np.sign(b.loc[q, "r_pooled"])),
+                                 cis_overlap=bool(max(a.loc[q, "ci_low"], b.loc[q, "ci_low"]) <= min(a.loc[q, "ci_high"], b.loc[q, "ci_high"]))))
+        agree = C.groupby("signature")["spearman_meanz_vs_precomputed"].agg(["median", "min", "max"]).add_prefix("method_agreement_")
+        out = pd.DataFrame(side).merge(agree, left_on="signature", right_index=True, how="left") if side else agree.reset_index()
+        out.to_csv(os.path.join(args.out, "score_method_comparison.csv"), index=False, float_format="%.4g")
+        C.to_csv(os.path.join(args.out, "score_method_agreement_per_cohort.csv"), index=False, float_format="%.4g")
+        print("\nScoring-method comparison (mean z-score vs precomputed):")
+        print(out.round(3).to_string(index=False))
     R = R.sort_values(["query", "r_pooled"], ascending=[True, False])
     R.to_csv(os.path.join(args.out, "pooled.csv"), index=False, float_format="%.4g")
 
@@ -454,7 +583,16 @@ def main():
     r.add_argument("--query-prefix", help="all states starting with this prefix, e.g. Epi_")
     r.add_argument("--cohorts", nargs="+", default=DEFAULT_COHORTS)
     r.add_argument("--targets", nargs="+", default=["states", "signatures"], choices=["states", "signatures"])
-    r.add_argument("--signatures", nargs="*", help=f"signature scores to use (default: {' '.join(DEFAULT_SIGNATURES)})")
+    r.add_argument("--signatures", nargs="*", help=f"built-in signature scores to use (default: {' '.join(DEFAULT_SIGNATURES)})")
+    r.add_argument("--signature", nargs="*", metavar="NAME=G1,G2",
+                   help="hypothesis gene signature(s) to test as targets, e.g. TGFB_RESP=SERPINE1,TGFBI,SMAD7,COL4A1")
+    r.add_argument("--signature-file", help="GMT (name, description, genes...) or two-column name/gene table")
+    r.add_argument("--genes", nargs="*", help="single genes to test as targets")
+    r.add_argument("--signature-scores", help="precomputed per-sample signature scores (rows samples/patients, columns signatures)")
+    r.add_argument("--signature-scores-transpose", action="store_true", help="precomputed table has signatures as rows")
+    r.add_argument("--signature-method", choices=["compare", "precomputed", "meanz"], default="compare",
+                   help="when a precomputed score has a matching gene list: test both and compare (default), "
+                        "precomputed only, or mean z-score only")
     r.add_argument("--adjust", nargs="*", default=["LEUKOCYTE", "CAF"],
                    help="covariates (default LEUKOCYTE CAF); also: age stage MSI_H, any signature, any score column")
     r.add_argument("--msi", action="store_true", help="also adjust for MSI-H where available")
