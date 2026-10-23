@@ -11,6 +11,8 @@ cell state from bulk tumor RNA-seq (TCGA via UCSC Xena, or your own data). Per c
   check. Survival-free and standalone (numpy, pandas, scipy only). Also tests user hypothesis signatures
   (`--signature`, `--genes`) and precomputed scores such as ssGSEA/GSVA (`--signature-scores`, compared with the
   mean z-score by default). `python state_context.py describe` prints its JSON schema.
+- `bayesprism/bayesprism_benchmark.R`: standalone BayesPrism benchmark (Linux) using colorectal single-cell
+  pseudo-bulks with known fractions and cell-type expression. See `bayesprism/README.md`.
 - `AGENT_GUIDE.md`: usage and interpretation rules, written for other AI agents and models.
 
 ## Quick start
