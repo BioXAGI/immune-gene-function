@@ -1,0 +1,95 @@
+{
+  "config": {
+    "cohort": "COADREAD",
+    "genes": [
+      "CD276",
+      "C1GALT1",
+      "C1GALT1C1",
+      "ST6GAL1",
+      "ST6GALNAC1",
+      "ST3GAL1",
+      "GCNT1",
+      "GCNT3",
+      "B3GNT3",
+      "MGAT3",
+      "MGAT5",
+      "FUT8",
+      "FUT3",
+      "GALNT3",
+      "LGALS3",
+      "LGALS9",
+      "TGFB1",
+      "ACTB",
+      "GAPDH"
+    ],
+    "signatures": [
+      "CTL",
+      "IFNG",
+      "EXHAUSTION",
+      "ANTIGEN_PRES",
+      "CAF",
+      "MACROPHAGE",
+      "M2_LIKE",
+      "TREG"
+    ],
+    "adjustments": [
+      "basic",
+      "full"
+    ],
+    "endpoints": [
+      "OS",
+      "PFI"
+    ],
+    "msi_low": "include",
+    "bootstrap_repetitions": 1000,
+    "seed": 20261029,
+    "cox_guards": {
+      "min_samples": 40,
+      "min_events": 20,
+      "events_per_parameter": 10
+    },
+    "panel_notes": {
+      "primary_hypotheses": [
+        "CD276",
+        "C1GALT1"
+      ],
+      "exploratory_glycosylation_panel": "C1GALT1C1; sialylation, branching, fucosylation and O-glycan candidates; LGALS3/LGALS9 are glycan-binding context genes. This is a hypothesis panel, not a validated MSS CRC dependency signature.",
+      "controls": "TGFB1 context comparator; ACTB/GAPDH calibration genes, not guaranteed biological nulls."
+    }
+  },
+  "command": [
+    "compare_crc_msi.py",
+    "--no-survival",
+    "--bootstrap",
+    "100",
+    "--out",
+    "/workspace/scratch/08a8bdae3ef4/crc_pilot_bootstrap"
+  ],
+  "python": "3.12.14",
+  "status": "completed",
+  "versions": {
+    "numpy": "2.3.5",
+    "pandas": "2.2.3",
+    "scipy": "1.17.0",
+    "lifelines": null
+  },
+  "git_commit": "fe7c76a15dc49250ce21d01aa2c65c8724f25dbc",
+  "source_sha256": {
+    "/workspace/scratch/08a8bdae3ef4/immune-gene-function/compare_crc_msi.py": "c451a9e5170974fbda1f58c86d7afe7be85f5d94fabc611a6e49dd2b06f8530e",
+    "/workspace/scratch/08a8bdae3ef4/immune-gene-function/immune_gene_function.py": "250098f8108f68248a758066ec77d2c574588cde5d3a3501b5bfadb7a6d847a5",
+    "analysis/crc_glycosylation.json": "99e8aab2787eaaa38f934d719eba7fd7d652fee2681a8a95eccb10e429f58841"
+  },
+  "input_sha256": {
+    "xena_cache/TCGA.COADREAD.sampleMap__COADREAD_clinicalMatrix": "4742eb0d07a5c40e2e90ac79070a89ac5a2e902216329b2bfeab3c44173d70eb",
+    "xena_cache/TCGA.COADREAD.sampleMap__HiSeqV2.gz": "638787b82dafa219180606e052144c27b08e11f4de163e8d8c2f502a899fa46e",
+    "xena_cache/survival__COADREAD_survival.txt": "0625f5973e0d85040f58ffe606e8ba57ff0dfe53198f532d7309d04059d29407"
+  },
+  "bootstrap_effective": 100,
+  "no_survival": true,
+  "cautions": [
+    "Exploratory prognosis, not immunotherapy response or causation",
+    "MSI status does not prove pMMR; bulk RNA cannot identify expressing cells",
+    "Delta CI is descriptive; overlapping cohorts are not independent",
+    "Bootstrap holds signature construction fixed; no cell-composition identification"
+  ]
+}

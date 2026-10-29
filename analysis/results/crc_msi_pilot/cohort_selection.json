@@ -1,0 +1,93 @@
+{
+  "selection": "pooled",
+  "msi_low_policy": "include",
+  "missing_policy": "exclude",
+  "n_input": 380,
+  "n_selected": 370,
+  "n_excluded": 10,
+  "n_unknown_input": 10,
+  "input_labels": {
+    "MSS": 254,
+    "MSI-L": 63,
+    "MSI-H": 53,
+    "UNKNOWN": 10
+  },
+  "selected_labels": {
+    "MSS": 254,
+    "MSI-L": 63,
+    "MSI-H": 53
+  },
+  "msi_source": "CDE_ID_3226963",
+  "note": "MSI-L grouped with MSS by default; MSI is not a direct pMMR assay.",
+  "survival": {
+    "OS": {
+      "n": 362,
+      "events": 84
+    },
+    "PFI": {
+      "n": 360,
+      "events": 99
+    }
+  },
+  "mss": {
+    "selection": "mss",
+    "msi_low_policy": "include",
+    "missing_policy": "keep",
+    "n_input": 370,
+    "n_selected": 317,
+    "n_excluded": 53,
+    "n_unknown_input": 0,
+    "input_labels": {
+      "MSS": 254,
+      "MSI-L": 63,
+      "MSI-H": 53
+    },
+    "selected_labels": {
+      "MSS": 254,
+      "MSI-L": 63
+    },
+    "msi_source": "CDE_ID_3226963",
+    "note": "MSI-L grouped with MSS by default; MSI is not a direct pMMR assay.",
+    "survival": {
+      "OS": {
+        "n": 311,
+        "events": 72
+      },
+      "PFI": {
+        "n": 309,
+        "events": 87
+      }
+    }
+  },
+  "msi_h": {
+    "selection": "msi-h",
+    "msi_low_policy": "include",
+    "missing_policy": "keep",
+    "n_input": 370,
+    "n_selected": 53,
+    "n_excluded": 317,
+    "n_unknown_input": 0,
+    "input_labels": {
+      "MSS": 254,
+      "MSI-L": 63,
+      "MSI-H": 53
+    },
+    "selected_labels": {
+      "MSI-H": 53
+    },
+    "msi_source": "CDE_ID_3226963",
+    "note": "MSI-L grouped with MSS by default; MSI is not a direct pMMR assay.",
+    "survival": {
+      "OS": {
+        "n": 51,
+        "events": 12
+      },
+      "PFI": {
+        "n": 51,
+        "events": 12
+      }
+    }
+  },
+  "cox_covariate_policy": "Available at >=70% in annotated pool; common complete cases; no imputation",
+  "difference_inference": "Paired MSI-stratified bootstrap; descriptive percentile CI, no p or q for delta"
+}

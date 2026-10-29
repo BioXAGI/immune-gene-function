@@ -29,3 +29,15 @@ First TCGA run downloads Xena files into `xena_cache/` (about 1 GB for all cohor
 TCGA cohorts have few events, scores are marker-gene averages (not cell counts), prognosis in untreated
 tumors is not immunotherapy response, and a single-cohort p near 0.05 is weak evidence. Include negative
 controls (ACTB, GAPDH) and rely on meta-analysis and replication.
+
+
+## Explicit CRC MSI cohorts and paired comparison
+
+`--msi-cohort pooled` preserves the default pooled cohort; `--msi` remains a separate
+adjustment flag. Use `--msi-cohort mss` (MSS + MSI-L by default), `--msi-low exclude`
+for strict MSS, or `--msi-cohort msi-h`. Unknown MSI labels are excluded from subgroups;
+pooled missing-data policy is configurable. Audits and per-model skip reasons are saved.
+
+See [CRC MSI analysis](docs/CRC_MSI_ANALYSIS.md) for exact commands, the reproducible
+CD276/C1GALT1 glycosylation panel, paired bootstrap comparison, FDR families, model guards,
+and interpretation limits. `python -m unittest discover -s tests -v` runs synthetic tests.
