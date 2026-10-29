@@ -185,12 +185,54 @@ def parse_stage(series):
                                [4, 3, 2, 1], np.nan), index=series.index)
 
 
+def msi_labels(series):
+    """Recognized labels only; unknown/ambiguous values never become MSS."""
+    normalized = series.astype(str).str.strip().str.upper().str.replace("_", "-", regex=False)
+    mapping = {"MSS": "MSS", "STABLE": "MSS", "MICROSATELLITE STABLE": "MSS",
+               "MSI-L": "MSI-L", "MSIL": "MSI-L", "L": "MSI-L", "LOW": "MSI-L",
+               "MSI-H": "MSI-H", "MSIH": "MSI-H", "H": "MSI-H", "HIGH": "MSI-H",
+               "MICROSATELLITE INSTABILITY-HIGH": "MSI-H",
+               "MICROSATELLITE INSTABILITY-LOW": "MSI-L"}
+    return normalized.map(mapping).fillna("UNKNOWN")
+
+
 def parse_msi(series):
-    s = series.astype(str).str.upper()
-    out = pd.Series(np.nan, index=series.index)
-    out[s.str.contains("MSI-H|MSI_H|MSIH|^H$|HIGH", regex=True)] = 1.0
-    out[s.str.contains("MSS|MSI-L|MSI_L|STABLE|^L$|LOW", regex=True)] = 0.0
-    return out
+    return msi_labels(series).map({"MSS": 0.0, "MSI-L": 0.0, "MSI-H": 1.0})
+
+
+def select_msi_cohort(df, selection="pooled", msi_low="include", missing="keep"):
+    """Filter before scores/models. Pooled defaults retain unknown annotations."""
+    labels = df.get("MSI_status", pd.Series("UNKNOWN", index=df.index))
+    if selection == "mss":
+        keep = labels.isin(["MSS", "MSI-L"] if msi_low == "include" else ["MSS"])
+    elif selection == "msi-h":
+        keep = labels.eq("MSI-H")
+    else:
+        keep = pd.Series(True, index=df.index)
+        if missing == "exclude":
+            keep &= labels.ne("UNKNOWN")
+    if missing == "error" and labels.eq("UNKNOWN").any():
+        raise ValueError("Missing/unrecognized MSI annotations; use --msi-missing keep or exclude")
+    out = df.loc[keep].copy()
+    report = {"selection": selection, "msi_low_policy": msi_low,
+              "missing_policy": missing, "n_input": len(df), "n_selected": len(out),
+              "n_excluded": int((~keep).sum()), "n_unknown_input": int(labels.eq("UNKNOWN").sum()),
+              "input_labels": labels.value_counts().to_dict(),
+              "selected_labels": labels[keep].value_counts().to_dict(),
+              "msi_source": df.attrs.get("msi_source", "custom:msi"),
+              "note": "MSI-L grouped with MSS by default; MSI is not a direct pMMR assay."}
+    return out, report
+
+
+def endpoint_counts(df, endpoints):
+    counts = {}
+    for ep in endpoints:
+        if has_endpoint(df, ep):
+            valid = df[ep].isin([0, 1]) & np.isfinite(df[f"{ep}.time"]) & (df[f"{ep}.time"] > 0)
+            counts[ep] = {"n": int(valid.sum()), "events": int(df.loc[valid, ep].sum())}
+        else:
+            counts[ep] = {"n": 0, "events": 0}
+    return counts
 
 
 # Clinical subsets usable as cohort names: name -> (parent TCGA cohort, selector on the clinical matrix)
@@ -221,11 +263,14 @@ def load_tcga(cohort, genes, cache, all_genes=False):
     df = expr.join(surv.drop(columns=[c for c in ["_PATIENT", "Redaction"] if c in surv]), how="left")
     age_col = next((c for c in ["age_at_initial_pathologic_diagnosis", "age"] if c in clin), None)
     stage_col = next((c for c in ["pathologic_stage", "clinical_stage", "ajcc_pathologic_tumor_stage"] if c in clin), None)
-    msi_col = next((c for c in MSI_COLUMNS if c in clin and clin[c].notna().sum() > 20), None)
+    msi_col = max((c for c in MSI_COLUMNS if c in clin),
+                  key=lambda c: parse_msi(clin[c]).notna().sum(), default=None)
     df["age"] = pd.to_numeric(clin[age_col], errors="coerce").reindex(df.index) if age_col else np.nan
     df["stage"] = parse_stage(clin[stage_col]).reindex(df.index) if stage_col else np.nan
     df["MSI_H"] = parse_msi(clin[msi_col]).reindex(df.index) if msi_col else np.nan
+    df["MSI_status"] = msi_labels(clin[msi_col]).reindex(df.index).fillna("UNKNOWN") if msi_col else "UNKNOWN"
     out = resolve_aliases(df, genes)
+    out.attrs["msi_source"] = msi_col
     out.attrs["genes"] = list(expr.columns)
     return out
 
@@ -242,6 +287,7 @@ def load_custom(args, genes):
     df["age"] = pd.to_numeric(df["age"], errors="coerce") if "age" in df else np.nan
     df["stage"] = parse_stage(df["stage"]) if "stage" in df else np.nan
     df["MSI_H"] = parse_msi(df["msi"]) if "msi" in df else np.nan
+    df["MSI_status"] = msi_labels(df["msi"]) if "msi" in df else "UNKNOWN"
     df = resolve_aliases(df, genes)
     if "cohort" in df:
         return {c: df[df["cohort"] == c] for c in df["cohort"].dropna().unique()}
@@ -311,14 +357,39 @@ def gene_frame(df, gene, names):
     return pd.DataFrame(cols)
 
 
-def partial_spearman(df, x, y, covars):
-    d = df[[x, y] + covars].dropna()
+def partial_spearman_details(df, x, y, covars):
+    cols = list(dict.fromkeys([x, y] + covars))
+    d = df.reindex(columns=cols).replace([np.inf, -np.inf], np.nan).dropna()
+    out = dict(r=np.nan, p=np.nan, n=len(d), ci_low=np.nan, ci_high=np.nan,
+               status="insufficient_samples", covariates="+".join(covars))
     if len(d) < 20:
-        return np.nan, np.nan
+        return out
     r = d.rank()
     C = np.column_stack([np.ones(len(r))] + [r[c] for c in covars])
-    res = lambda v: v - C @ np.linalg.lstsq(C, v, rcond=None)[0]
-    return stats.pearsonr(res(r[x].values), res(r[y].values))
+    rank = np.linalg.matrix_rank(C)
+    if rank < C.shape[1]:
+        out["status"] = "singular_covariates"
+        return out
+    residual = lambda v: v - C @ np.linalg.lstsq(C, v, rcond=None)[0]
+    a, b = residual(r[x].values), residual(r[y].values)
+    if np.std(a) < 1e-10 or np.std(b) < 1e-10:
+        out["status"] = "constant_residual"
+        return out
+    rho = float(np.clip(np.corrcoef(a, b)[0, 1], -1, 1))
+    dof = len(d) - rank - 1
+    if dof <= 1:
+        return out
+    t = rho * np.sqrt(dof / max(1e-15, 1 - rho*rho))
+    z = np.arctanh(np.clip(rho, -1+1e-12, 1-1e-12))
+    width = 1.96 / np.sqrt(len(d) - (rank - 1) - 3)
+    out.update(r=rho, p=float(2*stats.t.sf(abs(t), dof)),
+               ci_low=float(np.tanh(z-width)), ci_high=float(np.tanh(z+width)), status="ok")
+    return out
+
+
+def partial_spearman(df, x, y, covars):
+    out = partial_spearman_details(df, x, y, covars)
+    return out["r"], out["p"]
 
 
 def decompose(gf, gene, target, covars):
@@ -343,33 +414,85 @@ def has_endpoint(df, ep):
     return ep in df and f"{ep}.time" in df and df[ep].notna().sum() > 0
 
 
-def cox_interaction(df, gene, time, event, use_msi, extra=(), score="CTL"):
-    """Cox: hazard ~ S + X + S*X + covariates. S = `score` (CTL by default). Internal column names avoid
-    clashes when CTL itself is an extra covariate; output keys keep the historical CTL/CTLxX labels."""
-    from lifelines import CoxPHFitter
+def cox_interaction(df, gene, time, event, use_msi, extra=(), score="CTL",
+                    min_samples=40, min_events=20, events_per_parameter=10, fixed_covariates=None):
+    """Penalized exploratory Cox; fail closed on sparse or unstable designs."""
     base = ["stage", "age", "CAF"] + (["MSI_H"] if use_msi else []) + [e for e in extra if e != score]
-    cov = [c for c in usable_covariates(df, list(dict.fromkeys(base))) if c != gene]
-    d = df[[time, event] + list(dict.fromkeys([score, gene] + cov))].dropna()
-    d = d[d[time] > 0].copy()
-    out = {"n": len(d), "events": int(d[event].sum()) if len(d) else 0, "covariates": "+".join(cov)}
-    if out["events"] < MIN_EVENTS or d[gene].std() == 0 or d[score].std() == 0:
+    cov = [c for c in usable_covariates(df, list(dict.fromkeys(base))) if c not in [gene, score]]
+    if fixed_covariates is not None:
+        cov = list(fixed_covariates) + (["MSI_H"] if use_msi else [])
+    # Requested MSI adjustment must never silently disappear after complete-case filtering.
+    if use_msi and "MSI_H" not in cov:
+        return dict(n=0, events=0, status="msi_adjustment_unavailable")
+    d = df[[time, event] + list(dict.fromkeys([score, gene] + cov))].replace([np.inf, -np.inf], np.nan).dropna()
+    d = d[(d[time] > 0) & d[event].isin([0, 1])].copy()
+    out = dict(n=len(d), events=int(d[event].sum()), covariates="+".join(cov),
+               parameters=3+len(cov), status="not_fit", penalizer=0.01)
+    if len(d) < min_samples:
+        out["status"] = "insufficient_samples"
+        return out
+    if out["events"] < max(min_events, events_per_parameter*out["parameters"]):
+        out["status"] = "insufficient_events"
+        return out
+    if any(d[c].nunique() < 2 for c in [score, gene] + cov):
+        out["status"] = "constant_predictor"
         return out
     d["_S"], d["_X"] = zscore(d[score]), zscore(d[gene])
     d["_SxX"] = d["_S"] * d["_X"]
+    design = d[["_S", "_X", "_SxX"] + cov]
+    scaled = (design - design.mean()) / design.std()
+    out["condition_number"] = float(np.linalg.cond(scaled))
+    if np.linalg.matrix_rank(scaled) < scaled.shape[1] or out["condition_number"] > 1e8:
+        out["status"] = "singular_design"
+        return out
     try:
-        s = CoxPHFitter(penalizer=0.01).fit(d[[time, event, "_S", "_X", "_SxX"] + cov], time, event).summary
+        from lifelines import CoxPHFitter
+    except ImportError:
+        out["status"] = "dependency_missing:lifelines"
+        return out
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fit = CoxPHFitter(penalizer=0.01).fit(d[[time, event] + list(design.columns)], time, event)
+        messages = [str(w.message) for w in caught if "Convergence" in w.category.__name__]
+        if messages:
+            out.update(status="convergence_warning", error="; ".join(messages)[:300])
+            return out
+        summary = fit.summary
+        if not np.isfinite(summary[["coef", "se(coef)"]].values).all() or (summary["se(coef)"] <= 0).any():
+            out["status"] = "invalid_estimate"
+            return out
+        out["status"] = "ok"
         for term, lab in [("_X", "X"), ("_S", "CTL"), ("_SxX", "CTLxX")]:
-            out[f"logHR_{lab}"] = s.loc[term, "coef"]
-            out[f"se_{lab}"] = s.loc[term, "se(coef)"]
-            out[f"HR_{lab}"] = s.loc[term, "exp(coef)"]
-            out[f"p_{lab}"] = s.loc[term, "p"]
+            beta, se = summary.loc[term, ["coef", "se(coef)"]]
+            out.update({f"logHR_{lab}": beta, f"se_{lab}": se,
+                        f"HR_{lab}": np.exp(beta), f"p_{lab}": summary.loc[term, "p"],
+                        f"CI_low_{lab}": np.exp(beta-1.96*se), f"CI_high_{lab}": np.exp(beta+1.96*se)})
+        # Split-half models are descriptive only and get their own sample/event guard.
         hi = d["_X"] >= d["_X"].median()
         for lab, sub in [("Xlow", d[~hi]), ("Xhigh", d[hi])]:
-            ss = CoxPHFitter(penalizer=0.01).fit(sub[[time, event, "_S"] + cov], time, event).summary
-            out[f"HR_CTL_{lab}"] = ss.loc["_S", "exp(coef)"]
-            out[f"p_CTL_{lab}"] = ss.loc["_S", "p"]
+            out[f"n_{lab}"], out[f"events_{lab}"] = len(sub), int(sub[event].sum())
+            out[f"status_{lab}"] = "insufficient_samples_or_events"
+            if len(sub) < min_samples or sub[event].sum() < max(min_events, events_per_parameter*(1+len(cov))):
+                continue
+            if any(sub[c].nunique() < 2 for c in ["_S"] + cov):
+                out[f"status_{lab}"] = "constant_predictor"
+                continue
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    ss = CoxPHFitter(penalizer=0.01).fit(sub[[time, event, "_S"] + cov], time, event).summary
+                if any("Convergence" in w.category.__name__ for w in caught):
+                    out[f"status_{lab}"] = "convergence_warning"
+                    continue
+                out[f"HR_CTL_{lab}"] = ss.loc["_S", "exp(coef)"]
+                out[f"p_CTL_{lab}"] = ss.loc["_S", "p"]
+                out[f"status_{lab}"] = "ok"
+            except Exception as e:
+                out[f"status_{lab}"] = "fit_failed"
+                out[f"error_{lab}"] = str(e)[:150]
     except Exception as e:
-        out["error"] = str(e)[:80]
+        out.update(status="fit_failed", error=str(e)[:300])
     return out
 
 
@@ -448,20 +571,27 @@ def analyze_cohort(name, df, genes, args, decomp_scores, decomp_rows):
         if g not in df or df[g].std() == 0:
             continue
         gf = gene_frame(df, g, list(dict.fromkeys(SCORES_REPORTED + ["LEUKOCYTE"] + msi)))
-        r = {"cohort": name, "gene": g, "n_samples": len(df), "msi_adjusted": has_msi,
+        r = {"cohort": name, "gene": g, "n_samples": len(df), "msi_adjusted": has_msi, "msi_cohort": getattr(args, "msi_cohort", "pooled"),
+             "msi_adjustment_status": "used" if has_msi else ("unavailable_or_constant" if args.msi else "not_requested"),
              "pcorr_adjusted_for": "+".join(adj), "interaction_score": args.interaction_score,
              "extra_covariates": "+".join(args.adjust_scores), "median_expr": df[g].median(),
              "in_signatures": "+".join(n for n, gl in SIGS.items() if g in gl)}
         for s in SCORES_REPORTED:
             r[f"rho_{s}"] = stats.spearmanr(gf[g], gf[s], nan_policy="omit")[0]
-            r[f"pcorr_{s}"], r[f"pcorr_p_{s}"] = partial_spearman(gf, g, s, [c for c in adj if c != s])
-            r[f"pcorr_full_{s}"], r[f"pcorr_full_p_{s}"] = partial_spearman(gf, g, s, [c for c in full if c != s])
+            for prefix, covars in [("pcorr", adj), ("pcorr_full", full)]:
+                detail = partial_spearman_details(gf, g, s, [c for c in covars if c != s])
+                r[f"{prefix}_{s}"] = detail.pop("r")
+                for key, value in detail.items():
+                    r[f"{prefix}_{key}_{s}"] = value
             if decomp_rows is not None and s in decomp_scores:
                 decomp_rows += [{"cohort": name, "gene": g, "score": s, **d} for d in decompose(gf, g, s, full)]
         for ep in args.endpoints:
             if has_endpoint(df, ep):
                 for k, v in cox_interaction(df, g, f"{ep}.time", ep, has_msi,
-                                            args.adjust_scores, args.interaction_score).items():
+                                            args.adjust_scores, args.interaction_score,
+                                            getattr(args, "min_model_samples", 40),
+                                            getattr(args, "min_model_events", 20),
+                                            getattr(args, "events_per_parameter", 10)).items():
                     r[f"{ep}_{k}"] = v
         rows.append(r)
     res = pd.DataFrame(rows)
@@ -470,6 +600,12 @@ def analyze_cohort(name, df, genes, args, decomp_scores, decomp_rows):
             if f"{ep}_p_{term}" in res:
                 res[f"{ep}_q_{term}"] = bh(res[f"{ep}_p_{term}"])
     if not res.empty:
+        # One BH family per cohort and adjustment set, across all genes x signatures.
+        for pref in ["pcorr", "pcorr_full"]:
+            cols = [f"{pref}_p_{score}" for score in SCORES_REPORTED]
+            q = bh(res[cols].to_numpy().ravel()).reshape(len(res), len(cols))
+            for j, score in enumerate(SCORES_REPORTED):
+                res[f"{pref}_q_{score}"] = q[:, j]
         res["interpretation"] = res.apply(lambda r: interpret(r, args.endpoints, args.interaction_score), axis=1)
     return res, has_msi
 
@@ -724,6 +860,11 @@ def run_scan(args):
 
 # ============================================================================= self-description
 SCHEMA = {
+    "msi_cohort_selection": {"default": "pooled", "options": ["pooled", "mss", "msi-h"],
+        "MSS": "Includes MSI-L unless --msi-low exclude. Unknown labels excluded from both subgroups.",
+        "missing": "Pooled retains unknown labels unless --msi-missing exclude/error.",
+        "adjustment": "--msi controls adjustment independently; check msi_adjusted and actual model covariates.",
+        "audit": "cohort_selection.json; per-model n, events, parameters and status; sparse models skipped"},
     "purpose": "Infer whether a gene is linked to T-cell dysfunction, T-cell exclusion, or a specific "
                "immune/stromal cell compartment, using bulk tumor RNA-seq (TCGA via UCSC Xena, or custom).",
     "method_summary": {
@@ -785,6 +926,8 @@ def write_summary(args, genes, res, meta_df, out):
     import json
     S = args.interaction_score
     summ = {"command": " ".join(sys.argv), "interaction_score": S, "genes": genes,
+            "msi_cohort": args.msi_cohort, "msi_low": args.msi_low, "msi_missing": args.msi_missing,
+            "cohort_audit_file": "cohort_selection.json",
             "cohorts": sorted(res["cohort"].unique().tolist()), "endpoints": args.endpoints,
             "n_rows_per_cohort": res.groupby("cohort").size().to_dict(), "interaction_hits_p_lt_0.05": [],
             "meta_analysis_top": [], "specific_after_full_adjustment": []}
@@ -824,6 +967,12 @@ def parse_args():
     g.add_argument("--gene-file", help="one gene symbol per line")
     g.add_argument("--out", default="immune_gene_results")
     g = ap.add_argument_group("correlations")
+    g.add_argument("--msi-cohort", choices=["pooled", "mss", "msi-h"], default="pooled",
+                   help="explicit cohort selection before scores; MSS includes MSI-L by default")
+    g.add_argument("--msi-low", choices=["include", "exclude"], default="include",
+                   help="whether MSI-L belongs in the MSS-only cohort")
+    g.add_argument("--msi-missing", choices=["keep", "exclude", "error"], default="keep",
+                   help="unknown MSI: pooled keeps by default; subgroups always exclude")
     g.add_argument("--msi", action="store_true", help="adjust for MSI-H where available")
     g.add_argument("--pcorr-adjust", default="basic",
                    help="'basic', 'full' or a comma list of scores for pcorr_* columns "
@@ -831,6 +980,9 @@ def parse_args():
     g.add_argument("--decompose", nargs="*", default=None, metavar="SCORE",
                    help="write decomposition.csv for these scores (flag alone = CTL IFNG MACROPHAGE M2_LIKE NEUTROPHIL)")
     g = ap.add_argument_group("survival")
+    g.add_argument("--min-model-samples", type=int, default=40)
+    g.add_argument("--min-model-events", type=int, default=20)
+    g.add_argument("--events-per-parameter", type=float, default=10)
     g.add_argument("--no-survival", action="store_true", help="correlations only")
     g.add_argument("--endpoints", nargs="+", default=["OS", "PFI"])
     g.add_argument("--interaction-score", default="CTL",
@@ -858,6 +1010,12 @@ def parse_args():
     if args.describe:
         describe()
         sys.exit(0)
+    if args.msi_cohort != "pooled" and args.source == "tcga" and any(c not in ["COADREAD", "COAD", "READ"] for c in args.cohorts):
+        ap.error("MSI subgroup selection is restricted to colorectal TCGA cohorts")
+    if args.scan and (args.msi_cohort != "pooled" or args.msi_missing != "keep"):
+        ap.error("MSI cohort/missing selection is supported in the targeted pipeline, not --scan")
+    if args.min_model_samples < 4 or args.min_model_events < 1 or args.events_per_parameter <= 0:
+        ap.error("model guard thresholds must be positive (samples >= 4)")
     if args.no_survival:
         args.endpoints = []
     return args
@@ -906,6 +1064,16 @@ def main():
             except Exception as e:
                 print(f"  skipped {c}: {e}")
 
+    import json
+    audit = {}
+    for name, df in list(datasets.items()):
+        selected, report = select_msi_cohort(df, args.msi_cohort, args.msi_low, args.msi_missing)
+        report["survival"] = endpoint_counts(selected, args.endpoints)
+        audit[name] = report
+        datasets[name] = selected
+    # Write even if all subgroup analyses are empty or no model can fit.
+    with open(os.path.join(args.out, "cohort_selection.json"), "w") as f:
+        json.dump(audit, f, indent=2)
     all_res, prog_rows = [], []
     for name, df in datasets.items():
         df = attach_scores(add_scores(df), SCORE_DF)
@@ -993,3 +1161,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

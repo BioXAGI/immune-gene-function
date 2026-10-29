@@ -1,0 +1,16 @@
+{
+  "cohort": "COADREAD",
+  "genes": ["CD276", "C1GALT1", "C1GALT1C1", "ST6GAL1", "ST6GALNAC1", "ST3GAL1", "GCNT1", "GCNT3", "B3GNT3", "MGAT3", "MGAT5", "FUT8", "FUT3", "GALNT3", "LGALS3", "LGALS9", "TGFB1", "ACTB", "GAPDH"],
+  "signatures": ["CTL", "IFNG", "EXHAUSTION", "ANTIGEN_PRES", "CAF", "MACROPHAGE", "M2_LIKE", "TREG"],
+  "adjustments": ["basic", "full"],
+  "endpoints": ["OS", "PFI"],
+  "msi_low": "include",
+  "bootstrap_repetitions": 1000,
+  "seed": 20261029,
+  "cox_guards": {"min_samples": 40, "min_events": 20, "events_per_parameter": 10},
+  "panel_notes": {
+    "primary_hypotheses": ["CD276", "C1GALT1"],
+    "exploratory_glycosylation_panel": "C1GALT1C1; sialylation, branching, fucosylation and O-glycan candidates; LGALS3/LGALS9 are glycan-binding context genes. This is a hypothesis panel, not a validated MSS CRC dependency signature.",
+    "controls": "TGFB1 context comparator; ACTB/GAPDH calibration genes, not guaranteed biological nulls."
+  }
+}

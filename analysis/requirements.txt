@@ -1,0 +1,7 @@
+# Python 3.12 analysis environment; direct dependencies pinned, manifest records resolved versions.
+numpy==2.3.5
+pandas==2.2.3
+scipy==1.17.0
+lifelines==0.30.0
+matplotlib==3.10.8
+certifi==2026.10.19

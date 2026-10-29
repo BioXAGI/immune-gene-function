@@ -88,3 +88,18 @@ Precomputed signature scores (ssGSEA, GSVA, singscore, published per-sample scor
 and the Spearman agreement between the two scores per cohort), `precomputed` (precomputed only) or `meanz`
 (mean z-score only). Treat a result as robust when the two methods' CIs overlap; agreement below ~0.7 means the
 conclusion depends on the scoring method.
+
+
+## CRC MSI subgroup extension
+
+`--msi` does not select MSS. Use `--msi-cohort mss` or `msi-h`; default `pooled` preserves
+the expression cohort. MSS includes MSI-L unless `--msi-low exclude`. Unknown labels
+never enter either subgroup. Read `cohort_selection.json` and per-model n/events/status.
+The new targeted interaction models refuse sparse or unstable designs; correlations now
+report approximate CIs and p-values that account for residualization degrees of freedom.
+
+For predeclared CD276/C1GALT1/glycosylation comparisons run `compare_crc_msi.py` with
+`analysis/crc_glycosylation.json`. It requires a genuinely MSI-adjusted annotated pooled
+reference, converts interaction estimates to a common scale, and handles the nested
+cohort overlap through paired bootstrap resampling. Delta intervals are descriptive, not
+independent-group hypothesis tests. See `docs/CRC_MSI_ANALYSIS.md` for complete contracts.

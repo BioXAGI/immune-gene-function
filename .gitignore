@@ -8,3 +8,8 @@ output/
 *.csv
 *.json
 !requirements.json
+.venv/
+/results/
+!analysis/*.json
+!analysis/results/crc_msi_pilot/*.csv
+!analysis/results/crc_msi_pilot/*.json
